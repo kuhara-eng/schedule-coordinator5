@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>日程調整ボード</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Schedule Coordinator</p>
+        <h1>日程調整ボード</h1>
+      </div>
+      <div class="header-actions">
+        <button id="exportJsonBtn" class="ghost-button" type="button">JSON書き出し</button>
+        <button id="exportCsvBtn" class="ghost-button" type="button">CSV書き出し</button>
+        <label class="file-button">
+          JSON読み込み
+          <input id="importJsonInput" type="file" accept="application/json" />
+        </label>
+      </div>
+    </header>
+
+    <main class="app-shell">
+      <section class="meeting-switcher" aria-label="打ち合わせ切り替え">
+        <div id="meetingTabs" class="meeting-tabs"></div>
+        <button id="addMeetingBtn" class="primary-button" type="button">打ち合わせを追加</button>
+      </section>
+
+      <section class="cloud-panel" aria-label="共有設定">
+        <div>
+          <h2>共有</h2>
+          <p id="cloudStatus">ローカル保存で動作中</p>
+        </div>
+        <div class="cloud-actions">
+          <button id="createShareBtn" class="primary-button" type="button">共有リンクを作成</button>
+          <button id="copyShareBtn" class="ghost-button" type="button" disabled>リンクをコピー</button>
+        </div>
+      </section>
+
+      <section class="toolbar" aria-label="調整設定">
+        <label class="field title-field">
+          <span>打ち合わせ名</span>
+          <input id="meetingTitle" type="text" placeholder="例: 企画定例" />
+        </label>
+        <div class="date-tools">
+          <div class="date-tool-row">
+            <label class="field">
+              <span>候補日</span>
+              <input id="dateInput" type="date" />
+            </label>
+            <button id="addDateBtn" class="primary-button" type="button">1日追加</button>
+          </div>
+          <div class="date-tool-row">
+            <label class="field compact-field">
+              <span>開始日</span>
+              <input id="rangeStartInput" type="date" />
+            </label>
+            <label class="field compact-field">
+              <span>終了日</span>
+              <input id="rangeEndInput" type="date" />
+            </label>
+            <label class="checkbox-field">
+              <input id="excludeWeekends" type="checkbox" />
+              <span>土日を除く</span>
+            </label>
+            <button id="addDateRangeBtn" class="ghost-button" type="button">期間をまとめて追加</button>
+          </div>
+          <p id="dateCount" class="date-count">候補日 0日</p>
+        </div>
+        <button id="resetBtn" class="danger-button" type="button">全消去</button>
+      </section>
+
+      <section class="workspace">
+        <aside class="side-panel" aria-label="参加者">
+          <div class="panel-heading">
+            <h2>参加者</h2>
+            <span id="participantCount">0人</span>
+          </div>
+          <form id="participantForm" class="participant-form">
+            <input id="participantName" type="text" placeholder="名前を入力" autocomplete="off" />
+            <button class="primary-button" type="submit">追加</button>
+          </form>
+          <div id="participantList" class="participant-list"></div>
+        </aside>
+
+        <section class="board-area">
+          <div class="tabs" role="tablist" aria-label="表示切り替え">
+            <button id="inputTab" class="tab-button active" type="button">入力</button>
+            <button id="summaryTab" class="tab-button" type="button">集計</button>
+          </div>
+
+          <div id="emptyState" class="empty-state">
+            <h2>候補日と参加者を追加してください</h2>
+            <p>9:00から18:00まで、30分刻みで可否を登録できます。</p>
+          </div>
+
+          <div id="inputView" class="view">
+            <div class="board-header">
+              <div>
+                <h2 id="currentParticipantTitle">入力する参加者</h2>
+                <p>枠をクリックすると「可」「不可」が切り替わります。</p>
+              </div>
+              <button id="fillAvailableBtn" class="ghost-button" type="button">全て可にする</button>
+            </div>
+            <div id="availabilityGrid" class="grid-wrap"></div>
+          </div>
+
+          <div id="summaryView" class="view hidden">
+            <div class="board-header">
+              <div>
+                <h2>集計</h2>
+                <p>人数が多い時間ほど濃く表示されます。</p>
+              </div>
+              <div class="legend">
+                <span><i class="legend-best"></i>全員可</span>
+                <span><i class="legend-good"></i>一部可</span>
+                <span><i class="legend-none"></i>可なし</span>
+              </div>
+            </div>
+            <div id="bestSlots" class="best-slots"></div>
+            <div id="summaryGrid" class="grid-wrap"></div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <template id="dateHeaderTemplate">
+      <div class="date-header">
+        <span></span>
+        <button type="button" aria-label="候補日を削除">×</button>
+      </div>
+    </template>
+
+    <script src="./config.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

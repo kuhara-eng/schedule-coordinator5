@@ -240,7 +240,7 @@ async function loadSharedBoard() {
 
 function applyLoadedState(nextState) {
   cloud.applyingRemote = true;
-  appState = normalizeAppState(nextState);
+  mergeSharedPayload(nextState);
   syncActiveMeeting();
   if (!state.participants.some((person) => person.id === selectedParticipantId)) {
     selectedParticipantId = state.participants[0]?.id || null;
@@ -279,7 +279,7 @@ async function saveSharedBoardNow(options = {}) {
   const { error } = await cloud.client.rpc("save_schedule_board", {
     p_share_id: cloud.shareId,
     p_access_token: cloud.accessToken,
-    p_data: appState,
+    p_data: createSharedPayload(),
   });
 
   if (error) {
@@ -646,6 +646,26 @@ function normalizeAppState(value) {
   const meetings = value.meetings.map(normalizeMeeting);
   const activeMeetingId = meetings.some((meeting) => meeting.id === value.activeMeetingId) ? value.activeMeetingId : meetings[0].id;
   return { activeMeetingId, meetings };
+}
+
+function createSharedPayload() {
+  const meeting = normalizeMeeting(state);
+  return {
+    activeMeetingId: meeting.id,
+    meetings: [meeting],
+  };
+}
+
+function mergeSharedPayload(value) {
+  const sharedState = normalizeAppState(value);
+  const sharedMeeting = sharedState.meetings[0];
+  const existingIndex = appState.meetings.findIndex((meeting) => meeting.id === sharedMeeting.id);
+  if (existingIndex >= 0) {
+    appState.meetings[existingIndex] = sharedMeeting;
+  } else {
+    appState.meetings.push(sharedMeeting);
+  }
+  appState.activeMeetingId = sharedMeeting.id;
 }
 
 function normalizeMeeting(value) {

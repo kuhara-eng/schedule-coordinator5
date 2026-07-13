@@ -218,7 +218,9 @@ async function copyShareLink() {
 
 async function loadSharedBoard() {
   if (!isShareUrlComplete()) return;
+
   renderCloudStatus("共有データを読み込み中...");
+
   const { data, error } = await cloud.client.rpc("get_schedule_board", {
     p_share_id: cloud.shareId,
     p_access_token: cloud.accessToken,
@@ -231,19 +233,22 @@ async function loadSharedBoard() {
   }
 
   if (data?.meetings?.length) {
-  applyLoadedState(data);
-  return;
-}
+    applyLoadedState(data);
+    return;
+  }
 
-renderCloudStatus("共有データが見つかりません。");
+  renderCloudStatus("共有データが見つかりません。");
+}   // ←★★★★ この } が抜けています
 
 function applyLoadedState(nextState) {
   cloud.applyingRemote = true;
   mergeSharedPayload(nextState);
   syncActiveMeeting();
+
   if (!state.participants.some((person) => person.id === selectedParticipantId)) {
     selectedParticipantId = state.participants[0]?.id || null;
   }
+
   localStorage.setItem(getStorageKey(), JSON.stringify(appState));
   cloud.applyingRemote = false;
   render();

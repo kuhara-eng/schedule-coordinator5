@@ -1,26 +1,258 @@
+/* =========================================================================
+ * 日程調整ボード app.js
+ *
+ * ▼ 今回のリファクタリングの方針
+ *   「ローカルモード」と「共有モード」を最初から最後まで完全に分離する。
+ *   - Session   : URLを見て起動時に一度だけモードを確定する（唯一の判定役）
+ *   - LocalStorageRepo : ローカルモード専用の永続化（localStorageのみ）
+ *   - Cloud     : 共有モード専用の永続化（Supabase RPC + Realtime Broadcastのみ）
+ *   - persist() : どちらを呼ぶかを振り分けるだけの薄いディスパッチャ
+ *
+ *   共有モードでは appState.meetings は常に「共有された1件」だけを保持し、
+ *   localStorageの読み書きは一切行わない（要件①②③④⑤に対応）。
+ *
+ * ▼ 修正した既存バグ
+ *   - persist() が存在しない関数 getStorageKey() を呼んでおり、保存のたびに
+ *     例外が発生して処理が止まっていた（ローカル保存もクラウド保存も実質動作せず）。
+ *   - loadAppState() が存在しない関数 readStoredJson() を呼んでいた。
+ *   → どちらも今回の再設計で解消（LocalStorageRepo.readJson に統一）。
+ *
+ * ▼ 将来の拡張（管理者 / 参加者 / 閲覧専用モード）について
+ *   Permissions というごく薄い判定オブジェクトを用意した。
+ *   将来 Session に role ("admin" | "participant" | "viewer") を持たせ、
+ *   Permissions内の各関数をroleで分岐させるだけで、UIや保存ロジックを
+ *   ほとんど変えずに権限拡張できるようにしている。
+ * ========================================================================= */
+
+/* =========================================================================
+ * 定数
+ * ========================================================================= */
 const STORAGE_KEY = "schedule-coordinator-v2";
 const LEGACY_STORAGE_KEY = "schedule-coordinator-v1";
 const START_HOUR = 9;
 const END_HOUR = 18;
 const SLOT_MINUTES = 30;
 
+const MODE_LOCAL = "local";
+const MODE_SHARE = "share";
+
 const times = buildTimes();
-let appState = loadAppState();
-let state = getActiveMeeting();
-let selectedParticipantId = state.participants[0]?.id || null;
-let activeView = "input";
-let ignoreNextRealtime = false;
-let dragState = null;
-let cloud = {
-  client: null,
-  shareId: getShareIdFromUrl(),
-  accessToken: getAccessTokenFromUrl(),
-  channel: null,
-  applyingRemote: false,
-  saveTimer: null,
-  configured: false,
+
+/* =========================================================================
+ * Session: ローカル/共有モードの判定と、共有IDの保持
+ *
+ * ▼ 変更点
+ *   以前は shareId/accessToken が cloud オブジェクトの一部として散らばり、
+ *   appState（データ）と混ざって扱われていた。
+ *   ここでは「今どのモードで動いているか」を専任で管理する単一のオブジェクトに
+ *   まとめ、他のどのコードもURLを直接パースしないようにした。
+ * ========================================================================= */
+const Session = createSession();
+
+function createSession() {
+  const params = new URLSearchParams(window.location.search);
+  const shareId = params.get("board") || "";
+  const accessToken = params.get("token") || "";
+  const initialMode = shareId && accessToken ? MODE_SHARE : MODE_LOCAL;
+
+  return {
+    mode: initialMode,
+    shareId,
+    accessToken,
+
+    isLocal() {
+      return this.mode === MODE_LOCAL;
+    },
+    isShare() {
+      return this.mode === MODE_SHARE;
+    },
+
+    // ローカルモード → 共有モードへの唯一の遷移経路。
+    // 「共有リンクを作成」ボタンからのみ呼ばれる。
+    upgradeToShare(shareId, accessToken) {
+      this.mode = MODE_SHARE;
+      this.shareId = shareId;
+      this.accessToken = accessToken;
+      const url = new URL(window.location.href);
+      url.searchParams.set("board", shareId);
+      url.searchParams.set("token", accessToken);
+      window.history.replaceState(null, "", url.toString());
+    },
+
+    getShareUrl() {
+      const url = new URL(window.location.href);
+      url.searchParams.set("board", this.shareId);
+      url.searchParams.set("token", this.accessToken);
+      return url.toString();
+    },
+  };
+}
+
+/* =========================================================================
+ * Permissions: 将来の役割ベース拡張のための判定レイヤー
+ *
+ * 現時点ではモードだけを見て判定しているが、将来的に
+ *   Session.role = "admin" | "participant" | "viewer"
+ * を追加した際は、ここの分岐を増やすだけで済むようにしてある。
+ * 呼び出し側（イベントハンドラや描画）はPermissionsの結果だけを見ればよい。
+ * ========================================================================= */
+const Permissions = {
+  // 打ち合わせの追加・削除ができるか
+  // 共有モードは常に「共有された1件だけ」を保つ仕様のため不可。
+  canManageMeetings() {
+    return Session.isLocal();
+    // 将来: return Session.isLocal() || Session.role === "admin";
+  },
+
+  // 候補日・参加者・可否入力など、打ち合わせの中身を編集できるか
+  canEditContent() {
+    return true;
+    // 将来: return Session.role !== "viewer";
+  },
 };
 
+/* =========================================================================
+ * LocalStorageRepo: ローカルモード専用の永続化
+ *
+ * ▼ 変更点
+ *   共有モードからは絶対に呼ばれない（呼び出し箇所は persist() と init() の
+ *   ローカル分岐のみ）。以前存在した「共有データをlocalStorageにも書き込む」
+ *   処理は完全に削除した。
+ * ========================================================================= */
+const LocalStorageRepo = {
+  load() {
+    const storedV2 = this.readJson(STORAGE_KEY);
+    if (storedV2?.meetings?.length) return normalizeAppState(storedV2);
+
+    const legacy = this.readJson(LEGACY_STORAGE_KEY);
+    if (legacy && Array.isArray(legacy.dates) && Array.isArray(legacy.participants)) {
+      const meeting = normalizeMeeting({ id: crypto.randomUUID(), ...legacy });
+      return { activeMeetingId: meeting.id, meetings: [meeting] };
+    }
+
+    const meeting = createMeeting("新しい打ち合わせ");
+    return { activeMeetingId: meeting.id, meetings: [meeting] };
+  },
+
+  save(state) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  },
+
+  readJson(key) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  },
+};
+
+/* =========================================================================
+ * Cloud: 共有モード専用の永続化（Supabase RPC + Realtime Broadcast）
+ *
+ * ▼ 変更点
+ *   - localStorageへの参照を完全に排除。
+ *   - 「設定確認」「読み込み」「保存」「購読」をそれぞれ独立したメソッドにし、
+ *     呼び出し側（loadSharedBoard, createShareLinkなど）が流れを追いやすくした。
+ *   - RPCの成功/失敗を { ok, ... } の形で返し、呼び出し側でUI表示を組み立てる
+ *     責務分離にした（以前はCloud側でDOMを直接触っていた）。
+ * ========================================================================= */
+const Cloud = {
+  client: null,
+  channel: null,
+  configured: false,
+  applyingRemote: false,
+  ignoreNextRealtime: false,
+  saveTimer: null,
+
+  configure() {
+    const config = window.SCHEDULE_SUPABASE_CONFIG || {};
+    this.configured = Boolean(config.url && config.anonKey && window.supabase?.createClient);
+    if (this.configured && !this.client) {
+      this.client = window.supabase.createClient(config.url, config.anonKey);
+    }
+    return this.configured;
+  },
+
+  async load(shareId, accessToken) {
+    if (!this.client) return { ok: false, reason: "not-configured" };
+    const { data, error } = await this.client.rpc("get_schedule_board", {
+      p_share_id: shareId,
+      p_access_token: accessToken,
+    });
+    if (error) return { ok: false, reason: "error", error };
+    if (!data?.meetings?.length) return { ok: false, reason: "not-found" };
+    return { ok: true, data };
+  },
+
+  async save(shareId, accessToken, payload, { notify = true } = {}) {
+    if (!this.client) return { ok: false, reason: "not-configured" };
+    const { error } = await this.client.rpc("save_schedule_board", {
+      p_share_id: shareId,
+      p_access_token: accessToken,
+      p_data: payload,
+    });
+    if (error) return { ok: false, reason: "error", error };
+
+    if (notify && this.channel) {
+      this.ignoreNextRealtime = true;
+      await this.channel.send({
+        type: "broadcast",
+        event: "board_updated",
+        payload: { updatedAt: new Date().toISOString() },
+      });
+    }
+    return { ok: true };
+  },
+
+  // 250msデバウンスして保存する。呼ぶたびに最新のappStateを渡してもらう
+  // （buildPayloadをクロージャで持たせず、保存直前に呼び出す形にして
+  //   常に最新の状態を送るようにした）。
+  scheduleSave(shareId, accessToken, buildPayload, onResult) {
+    if (!this.client || this.applyingRemote) return;
+    clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(async () => {
+      const result = await this.save(shareId, accessToken, buildPayload());
+      onResult?.(result);
+    }, 250);
+  },
+
+  subscribe(shareId, accessToken, onRemoteChange) {
+    if (!this.client) return;
+    this.unsubscribe();
+    this.channel = this.client
+      .channel(`schedule-board:${shareId}:${accessToken}`, { config: { broadcast: { self: true } } })
+      .on("broadcast", { event: "board_updated" }, async () => {
+        if (this.ignoreNextRealtime) {
+          this.ignoreNextRealtime = false;
+          return;
+        }
+        await onRemoteChange();
+      })
+      .subscribe();
+  },
+
+  unsubscribe() {
+    if (this.channel) {
+      this.client?.removeChannel(this.channel);
+      this.channel = null;
+    }
+  },
+};
+
+/* =========================================================================
+ * アプリ状態
+ * ========================================================================= */
+let appState = { activeMeetingId: "", meetings: [] };
+let state = null;
+let selectedParticipantId = null;
+let activeView = "input";
+let dragState = null;
+
+/* =========================================================================
+ * DOM参照（index.html / styles.cssは変更していないため、要素・IDは従来通り）
+ * ========================================================================= */
 const els = {
   meetingTabs: document.querySelector("#meetingTabs"),
   addMeetingBtn: document.querySelector("#addMeetingBtn"),
@@ -57,19 +289,97 @@ const els = {
 
 init();
 
+/* =========================================================================
+ * 初期化
+ *
+ * ▼ 変更点（重要）
+ *   共有モードのときは LocalStorageRepo に一切触れずに起動する。
+ *   まず空のプレースホルダーで描画し、その後Supabaseから届いたデータで
+ *   appStateを丸ごと置き換える、という一方向の流れにした。
+ *   これにより「前に開いていた別会議のデータが一瞬でも表示される」
+ *   経路自体を無くしている。
+ * ========================================================================= */
 async function init() {
   setDefaultDate();
+  Cloud.configure();
+
+  if (Session.isShare()) {
+    // 共有モード: localStorageは読まない。Supabaseから届くまでは空の器。
+    appState = createEmptyMeetingState();
+  } else {
+    // ローカルモード: 従来通りlocalStorageから読み込む。
+    appState = LocalStorageRepo.load();
+  }
+
   syncActiveMeeting();
+  selectedParticipantId = state.participants[0]?.id || null;
+
   bindEvents();
   render();
-  await initCloudSync();
+
+  if (Session.isShare()) {
+    await initShareSession();
+  }
 }
 
+function createEmptyMeetingState() {
+  const meeting = createMeeting("");
+  return { activeMeetingId: meeting.id, meetings: [meeting] };
+}
+
+async function initShareSession() {
+  if (!Cloud.configured) {
+    renderCloudStatus("Supabase未設定のため共有データを利用できません。config.js を確認してください。");
+    return;
+  }
+  await loadSharedBoard();
+  Cloud.subscribe(Session.shareId, Session.accessToken, () => loadSharedBoard());
+}
+
+async function loadSharedBoard() {
+  renderCloudStatus("共有データを読み込み中...");
+  const result = await Cloud.load(Session.shareId, Session.accessToken);
+
+  if (!result.ok) {
+    if (result.reason === "not-found") {
+      renderCloudStatus("共有データがまだありません。入力を始めると新しく保存されます。");
+    } else {
+      console.error(result.error);
+      renderCloudStatus("共有データの読み込みに失敗しました。URLまたはSupabase設定を確認してください。");
+    }
+    return;
+  }
+
+  applyRemoteAppState(result.data);
+}
+
+// Supabaseから届いたデータで appState を丸ごと置き換える。
+// 共有モードでは常に「1件だけ」を保持する不変条件をここで強制する。
+function applyRemoteAppState(data) {
+  Cloud.applyingRemote = true;
+
+  const normalized = normalizeAppState(data);
+  const meeting = normalized.meetings[0];
+  appState = { activeMeetingId: meeting.id, meetings: [meeting] };
+
+  syncActiveMeeting();
+  if (!state.participants.some((person) => person.id === selectedParticipantId)) {
+    selectedParticipantId = state.participants[0]?.id || null;
+  }
+
+  Cloud.applyingRemote = false;
+  render();
+}
+
+/* =========================================================================
+ * イベントバインド
+ * ========================================================================= */
 function bindEvents() {
   els.createShareBtn.addEventListener("click", createShareLink);
   els.copyShareBtn.addEventListener("click", copyShareLink);
 
   els.addMeetingBtn.addEventListener("click", () => {
+    if (!Permissions.canManageMeetings()) return;
     const meeting = createMeeting("新しい打ち合わせ");
     appState.meetings.push(meeting);
     appState.activeMeetingId = meeting.id;
@@ -83,6 +393,7 @@ function bindEvents() {
   });
 
   els.meetingTitle.addEventListener("input", () => {
+    if (!Permissions.canEditContent()) return;
     state.title = els.meetingTitle.value;
     persist();
     renderMeetingTabs();
@@ -95,6 +406,7 @@ function bindEvents() {
   });
 
   els.resetBtn.addEventListener("click", () => {
+    if (!Permissions.canEditContent()) return;
     if (!confirm("この打ち合わせの入力内容をすべて消去しますか？")) return;
     const replacement = createMeeting(state.title || "新しい打ち合わせ");
     replacement.id = state.id;
@@ -108,6 +420,7 @@ function bindEvents() {
 
   els.participantForm.addEventListener("submit", (event) => {
     event.preventDefault();
+    if (!Permissions.canEditContent()) return;
     const name = els.participantName.value.trim();
     if (!name) return;
     const participant = { id: crypto.randomUUID(), name };
@@ -124,6 +437,7 @@ function bindEvents() {
   els.summaryTab.addEventListener("click", () => switchView("summary"));
 
   els.fillAvailableBtn.addEventListener("click", () => {
+    if (!Permissions.canEditContent()) return;
     if (!selectedParticipantId) return;
     state.dates.forEach((date) => {
       times.forEach((time) => setAvailability(selectedParticipantId, date, time, true));
@@ -149,11 +463,90 @@ function switchView(view) {
   els.summaryView.classList.toggle("hidden", view !== "summary");
 }
 
+/* =========================================================================
+ * 永続化ディスパッチャ
+ *
+ * ▼ 変更点（本リファクタリングの核）
+ *   以前はここで localStorage.setItem(getStorageKey(), ...) を無条件に呼び、
+ *   その後に共有保存を試みていた（しかも前者が存在しない関数のせいで
+ *   例外になり、共有保存にすら到達していなかった）。
+ *   今は「今のセッションがローカルか共有か」で完全に分岐し、
+ *   両方が同時に呼ばれることは構造上あり得ない。
+ * ========================================================================= */
+function persist() {
+  if (Session.isShare()) {
+    Cloud.scheduleSave(Session.shareId, Session.accessToken, createSharedPayload, handleCloudSaveResult);
+  } else {
+    LocalStorageRepo.save(appState);
+  }
+}
+
+function handleCloudSaveResult(result) {
+  if (!result.ok) {
+    console.error(result.error);
+    renderCloudStatus("共有データの保存に失敗しました。URLまたはSupabase設定を確認してください。");
+  }
+}
+
+/* =========================================================================
+ * 共有リンクの作成・コピー
+ *
+ * ▼ 変更点
+ *   「共有リンクを作成」は、ローカルモード→共有モードへの唯一の遷移経路。
+ *   遷移した瞬間に appState を「今アクティブな打ち合わせ1件だけ」に
+ *   絞り込み、以後このタブは共有モードとして振る舞う
+ *   （それ以降 persist() は二度とlocalStorageを使わない）。
+ * ========================================================================= */
+async function createShareLink() {
+  if (Session.isShare()) return; // 既に共有中は何もしない
+
+  if (!Cloud.configured && !Cloud.configure()) {
+    alert("config.js にSupabaseのURLとanon keyを設定してください。");
+    return;
+  }
+
+  const shareId = createShareId();
+  const accessToken = createAccessToken();
+
+  // 共有モードへ移行: 他の打ち合わせは同伴させず、今の1件だけを共有する。
+  const meeting = normalizeMeeting(state);
+  appState = { activeMeetingId: meeting.id, meetings: [meeting] };
+  Session.upgradeToShare(shareId, accessToken);
+  syncActiveMeeting();
+
+  renderCloudStatus("共有リンクを作成しています...");
+  const result = await Cloud.save(shareId, accessToken, createSharedPayload(), { notify: false });
+  if (!result.ok) {
+    console.error(result.error);
+    renderCloudStatus("共有データの保存に失敗しました。");
+    return;
+  }
+
+  Cloud.subscribe(shareId, accessToken, () => loadSharedBoard());
+  render(); // 打ち合わせ切り替えUIを共有モード仕様（追加不可・1件のみ）に更新
+  renderCloudStatus();
+}
+
+async function copyShareLink() {
+  if (!Session.isShare()) return;
+  const link = Session.getShareUrl();
+  try {
+    await navigator.clipboard.writeText(link);
+    renderCloudStatus("共有リンクをコピーしました。");
+  } catch {
+    prompt("このリンクを共有してください", link);
+  }
+}
+
+/* =========================================================================
+ * 描画
+ * ========================================================================= */
 function render() {
   syncActiveMeeting();
   ensureAvailabilityShape();
   els.meetingTitle.value = state.title;
   renderCloudStatus();
+  renderModeUI();
   renderMeetingTabs();
   renderDateCount();
   renderParticipants();
@@ -163,146 +556,31 @@ function render() {
 }
 
 function renderCloudStatus(message) {
-  const configMessage = cloud.configured ? "Supabase設定済み" : "Supabase未設定";
   if (message) {
     els.cloudStatus.textContent = message;
-  } else if (isShareUrlComplete()) {
-    els.cloudStatus.textContent = `リアルタイム共有中: ${cloud.shareId}`;
-  } else if (cloud.shareId || cloud.accessToken) {
-    els.cloudStatus.textContent = `${configMessage}。共有URLにboardとtokenの両方が必要です。`;
+  } else if (Session.isShare() && !Cloud.configured) {
+    els.cloudStatus.textContent = "Supabase未設定のため共有データを利用できません。config.js を確認してください。";
+  } else if (Session.isShare()) {
+    els.cloudStatus.textContent = `リアルタイム共有中: ${Session.shareId}`;
+  } else if (Cloud.configured) {
+    els.cloudStatus.textContent = "Supabase設定済み。現在はローカル保存です。";
   } else {
-    els.cloudStatus.textContent = `${configMessage}。現在はローカル保存です。`;
+    els.cloudStatus.textContent = "Supabase未設定。現在はローカル保存です。";
   }
-  els.createShareBtn.disabled = !cloud.configured;
-  els.copyShareBtn.disabled = !cloud.configured || !isShareUrlComplete();
+  els.createShareBtn.disabled = Session.isShare() || !Cloud.configured;
+  els.copyShareBtn.disabled = !Session.isShare();
 }
 
-async function initCloudSync() {
-  const config = window.SCHEDULE_SUPABASE_CONFIG || {};
-  cloud.configured = Boolean(config.url && config.anonKey && window.supabase?.createClient);
-  renderCloudStatus();
-  if (!cloud.configured || !isShareUrlComplete()) return;
-
-  cloud.client = window.supabase.createClient(config.url, config.anonKey);
-  await loadSharedBoard();
-  subscribeSharedBoard();
+// 共有モードでは「打ち合わせを追加」できないようにする（appState.meetingsは常に1件）。
+function renderModeUI() {
+  const sharing = Session.isShare();
+  els.addMeetingBtn.disabled = sharing || !Permissions.canManageMeetings();
+  els.addMeetingBtn.title = sharing ? "共有モードでは打ち合わせを追加できません（共有中の1件のみになります）" : "";
 }
 
-async function createShareLink() {
-  if (!cloud.configured) {
-    alert("config.js にSupabaseのURLとanon keyを設定してください。");
-    return;
-  }
-  if (!cloud.client) {
-    const config = window.SCHEDULE_SUPABASE_CONFIG || {};
-    cloud.client = window.supabase.createClient(config.url, config.anonKey);
-  }
-  cloud.shareId ||= createShareId();
-  cloud.accessToken ||= createAccessToken();
-  setShareCredentialsInUrl(cloud.shareId, cloud.accessToken);
-  renderCloudStatus("共有リンクを作成しています...");
-  await saveSharedBoardNow({ notify: false });
-  subscribeSharedBoard();
-  renderCloudStatus();
-}
-
-async function copyShareLink() {
-  const link = getShareUrl();
-  try {
-    await navigator.clipboard.writeText(link);
-    renderCloudStatus("共有リンクをコピーしました。");
-  } catch {
-    prompt("このリンクを共有してください", link);
-  }
-}
-
-async function loadSharedBoard() {
-  if (!isShareUrlComplete()) return;
-
-  renderCloudStatus("共有データを読み込み中...");
-
-  const { data, error } = await cloud.client.rpc("get_schedule_board", {
-    p_share_id: cloud.shareId,
-    p_access_token: cloud.accessToken,
-  });
-
-  if (error) {
-    console.error(error);
-    renderCloudStatus("共有データの読み込みに失敗しました。URLまたはSupabase設定を確認してください。");
-    return;
-  }
-
-  if (data?.meetings?.length) {
-    applyLoadedState(data);
-    return;
-  }
-
-  renderCloudStatus("共有データが見つかりません。");
-}   // ←★★★★ この } が抜けています
-
-function applyLoadedState(nextState) {
-  cloud.applyingRemote = true;
-  mergeSharedPayload(nextState);
-  syncActiveMeeting();
-
-  if (!state.participants.some((person) => person.id === selectedParticipantId)) {
-    selectedParticipantId = state.participants[0]?.id || null;
-  }
-
-  localStorage.setItem(getStorageKey(), JSON.stringify(appState));
-  cloud.applyingRemote = false;
-  render();
-}
-
-function subscribeSharedBoard() {
-  if (!cloud.client || !isShareUrlComplete()) return;
-  if (cloud.channel) cloud.client.removeChannel(cloud.channel);
-
-  cloud.channel = cloud.client
-    .channel(getRealtimeChannelName(), { config: { broadcast: { self: true } } })
-    .on("broadcast", { event: "board_updated" }, async () => {
-      if (ignoreNextRealtime) {
-        ignoreNextRealtime = false;
-        return;
-      }
-      await loadSharedBoard();
-    })
-    .subscribe();
-}
-
-function scheduleCloudSave() {
-  if (!cloud.client || !isShareUrlComplete() || cloud.applyingRemote) return;
-  clearTimeout(cloud.saveTimer);
-  cloud.saveTimer = setTimeout(() => saveSharedBoardNow(), 250);
-}
-
-async function saveSharedBoardNow(options = {}) {
-  if (!cloud.client || !isShareUrlComplete()) return;
-  const { notify = true } = options;
-
-  const { error } = await cloud.client.rpc("save_schedule_board", {
-    p_share_id: cloud.shareId,
-    p_access_token: cloud.accessToken,
-    p_data: createSharedPayload(),
-  });
-
-  if (error) {
-    ignoreNextRealtime = false;
-    console.error(error);
-    renderCloudStatus("共有データの保存に失敗しました。URLまたはSupabase設定を確認してください。");
-    return;
-  }
-
-  if (notify && cloud.channel) {
-    ignoreNextRealtime = true;
-    await cloud.channel.send({
-      type: "broadcast",
-      event: "board_updated",
-      payload: { updatedAt: new Date().toISOString() },
-    });
-  }
-}
-
+/* =========================================================================
+ * 打ち合わせ（Meeting）タブ
+ * ========================================================================= */
 function renderMeetingTabs() {
   els.meetingTabs.innerHTML = "";
   appState.meetings.forEach((meeting) => {
@@ -326,7 +604,7 @@ function renderMeetingTabs() {
     deleteButton.className = "meeting-tab-delete";
     deleteButton.textContent = "×";
     deleteButton.setAttribute("aria-label", `${switchButton.textContent}を削除`);
-    deleteButton.disabled = appState.meetings.length === 1;
+    deleteButton.disabled = appState.meetings.length === 1 || !Permissions.canManageMeetings();
     deleteButton.addEventListener("click", () => deleteMeeting(meeting.id));
 
     tab.append(switchButton, deleteButton);
@@ -335,6 +613,7 @@ function renderMeetingTabs() {
 }
 
 function deleteMeeting(meetingId) {
+  if (!Permissions.canManageMeetings()) return;
   if (appState.meetings.length === 1) return;
   const meeting = appState.meetings.find((candidate) => candidate.id === meetingId);
   const title = meeting?.title.trim() || "無題の打ち合わせ";
@@ -347,6 +626,9 @@ function deleteMeeting(meetingId) {
   render();
 }
 
+/* =========================================================================
+ * 参加者・可否入力
+ * ========================================================================= */
 function renderDateCount() {
   els.dateCount.textContent = `候補日 ${state.dates.length}日`;
 }
@@ -378,6 +660,7 @@ function renderParticipants() {
       item.classList.add("active");
     });
     nameInput.addEventListener("input", () => {
+      if (!Permissions.canEditContent()) return;
       person.name = nameInput.value;
       persist();
       renderSummary();
@@ -399,6 +682,7 @@ function renderParticipants() {
     deleteButton.type = "button";
     deleteButton.textContent = "削除";
     deleteButton.addEventListener("click", () => {
+      if (!Permissions.canEditContent()) return;
       state.participants = state.participants.filter((candidate) => candidate.id !== person.id);
       delete state.availability[person.id];
       if (selectedParticipantId === person.id) selectedParticipantId = state.participants[0]?.id || null;
@@ -433,6 +717,7 @@ function renderInputGrid() {
       button.addEventListener("pointerdown", (event) => startDragFill(event, button, person.id, date, time));
       button.addEventListener("pointerenter", () => continueDragFill(button, person.id, date, time));
       button.addEventListener("keydown", (event) => {
+        if (!Permissions.canEditContent()) return;
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
         const next = !getAvailability(person.id, date, time);
@@ -448,6 +733,7 @@ function renderInputGrid() {
 }
 
 function startDragFill(event, button, participantId, date, time) {
+  if (!Permissions.canEditContent()) return;
   if (event.button !== 0) return;
   event.preventDefault();
   const value = !getAvailability(participantId, date, time);
@@ -475,6 +761,9 @@ function applyAvailabilityToButton(button, participantId, date, time, value) {
   if (dragState) dragState.changed = true;
 }
 
+/* =========================================================================
+ * 集計
+ * ========================================================================= */
 function renderSummary() {
   els.summaryGrid.innerHTML = "";
   els.bestSlots.innerHTML = "";
@@ -528,6 +817,9 @@ function renderBestSlots(summaries) {
   });
 }
 
+/* =========================================================================
+ * グリッド共通部品
+ * ========================================================================= */
 function createGridElement() {
   const grid = document.createElement("div");
   grid.className = "schedule-grid";
@@ -554,6 +846,7 @@ function createDateHeader(date) {
   const header = template.content.firstElementChild.cloneNode(true);
   header.querySelector("span").textContent = formatDate(date);
   header.querySelector("button").addEventListener("click", () => {
+    if (!Permissions.canEditContent()) return;
     state.dates = state.dates.filter((candidate) => candidate !== date);
     state.participants.forEach((person) => {
       delete state.availability[person.id]?.[date];
@@ -575,6 +868,7 @@ function buildTimes() {
 }
 
 function addDates(dates) {
+  if (!Permissions.canEditContent()) return;
   const validDates = dates.filter(Boolean);
   if (validDates.length === 0) return;
   const before = state.dates.length;
@@ -623,50 +917,23 @@ function setAvailability(participantId, date, time, value) {
   state.availability[participantId][date][time] = value;
 }
 
-function loadAppState() {
-  // 共有URLの場合はローカル保存を読み込まない
-  if (getShareIdFromUrl() && getAccessTokenFromUrl()) {
-    return {
-      activeMeetingId: "",
-      meetings: [],
-    };
-  }
-
-  const storedV2 = readStoredJson(STORAGE_KEY);
-  if (storedV2?.meetings?.length) return normalizeAppState(storedV2);
-
-  const legacy = readStoredJson(LEGACY_STORAGE_KEY);
-  if (legacy && Array.isArray(legacy.dates) && Array.isArray(legacy.participants)) {
-    const meeting = normalizeMeeting({ id: crypto.randomUUID(), ...legacy });
-    return {
-      activeMeetingId: meeting.id,
-      meetings: [meeting],
-    };
-  }
-
-  const meeting = createMeeting("新しい打ち合わせ");
-  return {
-    activeMeetingId: meeting.id,
-    meetings: [meeting],
-  };
-}
-
+/* =========================================================================
+ * 状態の正規化・共有ペイロード生成・打ち合わせ操作
+ * ========================================================================= */
 function normalizeAppState(value) {
   const meetings = value.meetings.map(normalizeMeeting);
-  const activeMeetingId = meetings.some((meeting) => meeting.id === value.activeMeetingId) ? value.activeMeetingId : meetings[0].id;
+  const activeMeetingId = meetings.some((meeting) => meeting.id === value.activeMeetingId)
+    ? value.activeMeetingId
+    : meetings[0].id;
   return { activeMeetingId, meetings };
 }
 
+// 共有モード保存用のペイロード。常に「今アクティブな1件だけ」を送る
+// （appState.meetingsが共有モードでは既に1件のみである前提だが、
+//   念のためstateから作り直して不変条件を保証する）。
 function createSharedPayload() {
   const meeting = normalizeMeeting(state);
-  return {
-    activeMeetingId: meeting.id,
-    meetings: [meeting],
-  };
-}
-
-function mergeSharedPayload(value) {
-  appState = normalizeAppState(value);
+  return { activeMeetingId: meeting.id, meetings: [meeting] };
 }
 
 function normalizeMeeting(value) {
@@ -697,11 +964,9 @@ function syncActiveMeeting() {
   appState.activeMeetingId = state.id;
 }
 
-function persist() {
-  localStorage.setItem(getStorageKey(), JSON.stringify(appState));
-  scheduleCloudSave();
-}
-
+/* =========================================================================
+ * 日付ユーティリティ
+ * ========================================================================= */
 function setDefaultDate() {
   const value = formatInputDate(new Date());
   els.dateInput.value = value;
@@ -730,36 +995,9 @@ function formatInputDate(date) {
   return `${year}-${month}-${day}`;
 }
 
-function getShareIdFromUrl() {
-  return new URLSearchParams(window.location.search).get("board") || "";
-}
-
-function getAccessTokenFromUrl() {
-  return new URLSearchParams(window.location.search).get("token") || "";
-}
-
-function isShareUrlComplete() {
-  return Boolean(cloud.shareId && cloud.accessToken);
-}
-
-function setShareCredentialsInUrl(shareId, accessToken) {
-  const url = new URL(window.location.href);
-  url.searchParams.set("board", shareId);
-  url.searchParams.set("token", accessToken);
-  window.history.replaceState(null, "", url.toString());
-}
-
-function getShareUrl() {
-  const url = new URL(window.location.href);
-  url.searchParams.set("board", cloud.shareId);
-  url.searchParams.set("token", cloud.accessToken);
-  return url.toString();
-}
-
-function getRealtimeChannelName() {
-  return `schedule-board:${cloud.shareId}:${cloud.accessToken}`;
-}
-
+/* =========================================================================
+ * 共有ID/トークン生成
+ * ========================================================================= */
 function createShareId() {
   return bytesToHex(crypto.getRandomValues(new Uint8Array(12)));
 }
@@ -772,6 +1010,9 @@ function bytesToHex(bytes) {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+/* =========================================================================
+ * 入出力（JSON/CSV）
+ * ========================================================================= */
 function exportJson() {
   downloadFile(`${fileBaseName()}_all.json`, JSON.stringify(appState, null, 2), "application/json");
 }
@@ -795,14 +1036,24 @@ function importJson(event) {
   reader.addEventListener("load", () => {
     try {
       const imported = JSON.parse(reader.result);
+      let nextState;
       if (imported?.meetings?.length) {
-        appState = normalizeAppState(imported);
+        nextState = normalizeAppState(imported);
       } else if (Array.isArray(imported.dates) && Array.isArray(imported.participants)) {
         const meeting = normalizeMeeting({ id: crypto.randomUUID(), ...imported });
-        appState = { activeMeetingId: meeting.id, meetings: [meeting] };
+        nextState = { activeMeetingId: meeting.id, meetings: [meeting] };
       } else {
         throw new Error("Invalid data");
       }
+
+      // 共有モードでは appState.meetings を常に1件に保つ不変条件を、
+      // インポート経路でも必ず守る。
+      if (Session.isShare()) {
+        const meeting = nextState.meetings[0];
+        nextState = { activeMeetingId: meeting.id, meetings: [meeting] };
+      }
+
+      appState = nextState;
       syncActiveMeeting();
       selectedParticipantId = state.participants[0]?.id || null;
       ensureAvailabilityShape();
@@ -836,6 +1087,9 @@ function fileBaseName() {
   return name.replace(/[\\/:*?"<>|]/g, "_");
 }
 
+/* =========================================================================
+ * 汎用ユーティリティ
+ * ========================================================================= */
 function escapeHtml(value) {
   return value.replace(/[&<>"']/g, (char) => {
     const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" };

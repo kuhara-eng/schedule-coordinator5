@@ -231,12 +231,11 @@ async function loadSharedBoard() {
   }
 
   if (data?.meetings?.length) {
-    applyLoadedState(data);
-    return;
-  }
-
-  renderCloudStatus("共有データが見つかりません。URLのboardとtokenを確認してください。");
+  applyLoadedState(data);
+  return;
 }
+
+renderCloudStatus("共有データが見つかりません。");
 
 function applyLoadedState(nextState) {
   cloud.applyingRemote = true;
@@ -245,7 +244,7 @@ function applyLoadedState(nextState) {
   if (!state.participants.some((person) => person.id === selectedParticipantId)) {
     selectedParticipantId = state.participants[0]?.id || null;
   }
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
+  localStorage.setItem(getStorageKey(), JSON.stringify(appState));
   cloud.applyingRemote = false;
   render();
 }
@@ -620,26 +619,31 @@ function setAvailability(participantId, date, time, value) {
 }
 
 function loadAppState() {
+  // 共有URLの場合はローカル保存を読み込まない
+  if (getShareIdFromUrl() && getAccessTokenFromUrl()) {
+    return {
+      activeMeetingId: "",
+      meetings: [],
+    };
+  }
+
   const storedV2 = readStoredJson(STORAGE_KEY);
   if (storedV2?.meetings?.length) return normalizeAppState(storedV2);
 
   const legacy = readStoredJson(LEGACY_STORAGE_KEY);
   if (legacy && Array.isArray(legacy.dates) && Array.isArray(legacy.participants)) {
     const meeting = normalizeMeeting({ id: crypto.randomUUID(), ...legacy });
-    return { activeMeetingId: meeting.id, meetings: [meeting] };
+    return {
+      activeMeetingId: meeting.id,
+      meetings: [meeting],
+    };
   }
 
   const meeting = createMeeting("新しい打ち合わせ");
-  return { activeMeetingId: meeting.id, meetings: [meeting] };
-}
-
-function readStoredJson(key) {
-  try {
-    return JSON.parse(localStorage.getItem(key));
-  } catch {
-    localStorage.removeItem(key);
-    return null;
-  }
+  return {
+    activeMeetingId: meeting.id,
+    meetings: [meeting],
+  };
 }
 
 function normalizeAppState(value) {
@@ -657,15 +661,7 @@ function createSharedPayload() {
 }
 
 function mergeSharedPayload(value) {
-  const sharedState = normalizeAppState(value);
-  const sharedMeeting = sharedState.meetings[0];
-  const existingIndex = appState.meetings.findIndex((meeting) => meeting.id === sharedMeeting.id);
-  if (existingIndex >= 0) {
-    appState.meetings[existingIndex] = sharedMeeting;
-  } else {
-    appState.meetings.push(sharedMeeting);
-  }
-  appState.activeMeetingId = sharedMeeting.id;
+  appState = normalizeAppState(value);
 }
 
 function normalizeMeeting(value) {
@@ -697,7 +693,7 @@ function syncActiveMeeting() {
 }
 
 function persist() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
+  localStorage.setItem(getStorageKey(), JSON.stringify(appState));
   scheduleCloudSave();
 }
 

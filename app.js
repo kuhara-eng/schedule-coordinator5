@@ -8,8 +8,12 @@
  *   - Cloud     : 共有モード専用の永続化（Supabase RPC + Realtime Broadcastのみ）
  *   - persist() : どちらを呼ぶかを振り分けるだけの薄いディスパッチャ
  *
- *   共有モードでは appState.meetings は常に「共有された1件」だけを保持し、
- *   localStorageの読み書きは一切行わない（要件①②③④⑤に対応）。
+ *   モードによって変わるのは「どこに保存するか」だけで、
+ *   「打ち合わせを何件持てるか」はローカル/共有どちらも同じ（複数可）。
+ *   共有モードでも appState.meetings は複数件持てるが、その保存先は
+ *   常にSupabaseのみで、localStorageの読み書きは一切行わない
+ *   （要件①②④⑤に対応。要件③は「共有中は打ち合わせ追加不可」だったが、
+ *   後続のやり取りで「共有URLからも追加できるようにしたい」に変更された）。
  *
  * ▼ 修正した既存バグ
  *   - persist() が存在しない関数 getStorageKey() を呼んでおり、保存のたびに
@@ -98,10 +102,11 @@ function createSession() {
  * ========================================================================= */
 const Permissions = {
   // 打ち合わせの追加・削除ができるか
-  // 共有モードは常に「共有された1件だけ」を保つ仕様のため不可。
+  // ローカル/共有どちらのモードでも許可する
+  // （共有URLを開いた人も新しい打ち合わせを追加できる）。
   canManageMeetings() {
-    return Session.isLocal();
-    // 将来: return Session.isLocal() || Session.role === "admin";
+    return true;
+    // 将来: return Session.role !== "viewer"; のように役割で分岐する想定。
   },
 
   // 候補日・参加者・可否入力など、打ち合わせの中身を編集できるか
@@ -354,13 +359,12 @@ async function loadSharedBoard() {
 }
 
 // Supabaseから届いたデータで appState を丸ごと置き換える。
-// 共有モードでは常に「1件だけ」を保持する不変条件をここで強制する。
+// 共有ボード側が持つ打ち合わせは何件でもよく、そのまま appState に反映する
+// （以前は1件に絞り込んでいたが、共有URLからの複数会議追加に対応するため撤廃）。
 function applyRemoteAppState(data) {
   Cloud.applyingRemote = true;
 
-  const normalized = normalizeAppState(data);
-  const meeting = normalized.meetings[0];
-  appState = { activeMeetingId: meeting.id, meetings: [meeting] };
+  appState = normalizeAppState(data);
 
   syncActiveMeeting();
   if (!state.participants.some((person) => person.id === selectedParticipantId)) {
@@ -493,9 +497,10 @@ function handleCloudSaveResult(result) {
  *
  * ▼ 変更点
  *   「共有リンクを作成」は、ローカルモード→共有モードへの唯一の遷移経路。
- *   遷移した瞬間に appState を「今アクティブな打ち合わせ1件だけ」に
- *   絞り込み、以後このタブは共有モードとして振る舞う
- *   （それ以降 persist() は二度とlocalStorageを使わない）。
+ *   遷移した瞬間、その時点でローカルに持っていた打ち合わせを全件そのまま
+ *   共有ボードに引き継ぐ（1件だけに絞り込むことはしない）。
+ *   以後このタブは共有モードとして振る舞い、persist() は二度とlocalStorageを
+ *   使わずSupabaseだけを保存先にする。
  * ========================================================================= */
 async function createShareLink() {
   if (Session.isShare()) return; // 既に共有中は何もしない
@@ -508,9 +513,8 @@ async function createShareLink() {
   const shareId = createShareId();
   const accessToken = createAccessToken();
 
-  // 共有モードへ移行: 他の打ち合わせは同伴させず、今の1件だけを共有する。
-  const meeting = normalizeMeeting(state);
-  appState = { activeMeetingId: meeting.id, meetings: [meeting] };
+  // 共有モードへ移行: ローカルに存在する打ち合わせをすべて共有ボードへ引き継ぐ。
+  appState = normalizeAppState(appState);
   Session.upgradeToShare(shareId, accessToken);
   syncActiveMeeting();
 
@@ -523,7 +527,7 @@ async function createShareLink() {
   }
 
   Cloud.subscribe(shareId, accessToken, () => loadSharedBoard());
-  render(); // 打ち合わせ切り替えUIを共有モード仕様（追加不可・1件のみ）に更新
+  render(); // 共有ステータス表示・タブなどを共有モードの状態に更新
   renderCloudStatus();
 }
 
@@ -571,11 +575,12 @@ function renderCloudStatus(message) {
   els.copyShareBtn.disabled = !Session.isShare();
 }
 
-// 共有モードでは「打ち合わせを追加」できないようにする（appState.meetingsは常に1件）。
+// 打ち合わせの追加可否はPermissionsに委ねる（現状はローカル/共有どちらも許可）。
+// 将来、閲覧専用モードなどで制限したくなった場合はここが唯一の変更点になる。
 function renderModeUI() {
-  const sharing = Session.isShare();
-  els.addMeetingBtn.disabled = sharing || !Permissions.canManageMeetings();
-  els.addMeetingBtn.title = sharing ? "共有モードでは打ち合わせを追加できません（共有中の1件のみになります）" : "";
+  const allowed = Permissions.canManageMeetings();
+  els.addMeetingBtn.disabled = !allowed;
+  els.addMeetingBtn.title = allowed ? "" : "この画面では打ち合わせを追加できません";
 }
 
 /* =========================================================================
@@ -928,12 +933,10 @@ function normalizeAppState(value) {
   return { activeMeetingId, meetings };
 }
 
-// 共有モード保存用のペイロード。常に「今アクティブな1件だけ」を送る
-// （appState.meetingsが共有モードでは既に1件のみである前提だが、
-//   念のためstateから作り直して不変条件を保証する）。
+// 共有モード保存用のペイロード。appState.meetingsを全件そのまま送る
+// （共有URLからも打ち合わせを複数追加できるようにしたため、1件に絞らない）。
 function createSharedPayload() {
-  const meeting = normalizeMeeting(state);
-  return { activeMeetingId: meeting.id, meetings: [meeting] };
+  return normalizeAppState(appState);
 }
 
 function normalizeMeeting(value) {
@@ -1046,13 +1049,8 @@ function importJson(event) {
         throw new Error("Invalid data");
       }
 
-      // 共有モードでは appState.meetings を常に1件に保つ不変条件を、
-      // インポート経路でも必ず守る。
-      if (Session.isShare()) {
-        const meeting = nextState.meetings[0];
-        nextState = { activeMeetingId: meeting.id, meetings: [meeting] };
-      }
-
+      // ローカル/共有どちらのモードでも、インポートした内容をそのまま
+      // 打ち合わせの一覧として反映する（件数の制限はない）。
       appState = nextState;
       syncActiveMeeting();
       selectedParticipantId = state.participants[0]?.id || null;
